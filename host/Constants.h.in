@@ -1,0 +1,4 @@
+// Auto-generated - do not edit
+// clang-format off
+#pragma once
+constexpr auto KERNELS_DIR = "@KERNELS_DIR@";
