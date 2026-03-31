@@ -49,6 +49,8 @@ struct VerifyResult {
     std::vector<float> h_C_ref;
 };
 
+void check_stream_errors(rt::RuntimePtr& runtime, rt::StreamId stream);
+
 HostData initialize_host_data(rt::RuntimePtr& runtime,
                               rt::StreamId stream,
                               const DeviceBuffers& device_buffers,

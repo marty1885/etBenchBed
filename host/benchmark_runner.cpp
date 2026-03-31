@@ -3,11 +3,25 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdlib>
 #include <random>
 
 #include <cblas.h>
 
 namespace hostbench {
+
+void check_stream_errors(rt::RuntimePtr& runtime, rt::StreamId stream) {
+    auto errors = runtime->retrieveStreamErrors(stream);
+    if (errors.empty()) {
+        return;
+    }
+    fprintf(stderr, "\nFATAL: %zu device error(s) after kernel launch:\n", errors.size());
+    for (const auto& e : errors) {
+        fprintf(stderr, "  %s\n", e.getString().c_str());
+    }
+    fprintf(stderr, "The device may need a reboot.\n");
+    std::exit(2);
+}
 
 HostData initialize_host_data(rt::RuntimePtr& runtime,
                               rt::StreamId stream,
@@ -132,6 +146,7 @@ VerifyResult run_verify(rt::RuntimePtr& runtime,
         launch_spec.params_size,
         launch_options);
     runtime->waitForStream(stream);
+    check_stream_errors(runtime, stream);
 
     const size_t c_elems = static_cast<size_t>(point.m) * point.n;
     result.h_C_dev.resize(c_elems);
@@ -207,6 +222,7 @@ BenchResult run_perf(rt::RuntimePtr& runtime,
     }
     if (warmup_runs > 0) {
         runtime->waitForStream(stream);
+        check_stream_errors(runtime, stream);
     }
 
     double total_us = 0.0;
@@ -231,6 +247,8 @@ BenchResult run_perf(rt::RuntimePtr& runtime,
         }
         runtime->waitForStream(stream);
         const auto t1 = std::chrono::high_resolution_clock::now();
+
+        check_stream_errors(runtime, stream);
 
         total_us += std::chrono::duration<double, std::micro>(t1 - t0).count();
         total_runs += batch;

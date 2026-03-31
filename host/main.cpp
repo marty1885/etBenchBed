@@ -42,6 +42,7 @@ struct CliOptions {
     unsigned seed = 42;
     bool custom_seed = false;
     std::string kernel_override;
+    bool diag = false;
 };
 
 struct AllocationPlan {
@@ -84,6 +85,8 @@ bool parse_cli(int argc, char** argv, CliOptions& options, std::string& error) {
         } else if (std::strcmp(argv[i], "--seed") == 0 && i + 1 < argc) {
             options.seed = static_cast<unsigned>(std::strtoul(argv[++i], nullptr, 0));
             options.custom_seed = true;
+        } else if (std::strcmp(argv[i], "--diag") == 0) {
+            options.diag = true;
         } else {
             error = "Invalid arguments";
             return false;
@@ -92,9 +95,25 @@ bool parse_cli(int argc, char** argv, CliOptions& options, std::string& error) {
     return true;
 }
 
-const char* usage_string() {
-    return "Usage: bench_host --bench %s [-m M -k K -n N] [--sweep] [--verify] "
-           "[--runs N] [--warmup N] [--csv FILE] [--kernel ELF] [--seed SEED]\n";
+void print_usage(const char* bench_names) {
+    fprintf(stderr,
+        "Usage: bench_host [--bench %s] [options]\n"
+        "       bench_host --diag\n"
+        "\n"
+        "Options:\n"
+        "  --bench NAME    Benchmark to run: %s\n"
+        "  -m M            M dimension (default: 4096)\n"
+        "  -k K            K dimension (default: 4096)\n"
+        "  -n N            N dimension (default: 16)\n"
+        "  --sweep         Run predefined sweep points\n"
+        "  --verify        Verify device output against OpenBLAS reference\n"
+        "  --runs N        Minimum runs per point (default: 10)\n"
+        "  --warmup N      Warmup runs (default: 2)\n"
+        "  --csv FILE      Write results to CSV\n"
+        "  --kernel ELF    Override kernel binary path\n"
+        "  --seed SEED     Random seed for input data (default: 42)\n"
+        "  --diag          Run device diagnostic (upload, kernel exec, readback)\n",
+        bench_names, bench_names);
 }
 
 std::vector<std::byte> read_file(const std::string& path) {
@@ -173,13 +192,20 @@ void write_csv_row(FILE* csv, const BenchDesc& bench, const TestPoint& point, co
 }  // namespace
 
 int main(int argc, char** argv) {
+    for (int i = 1; i < argc; ++i) {
+        if (std::strcmp(argv[i], "--help") == 0 || std::strcmp(argv[i], "-h") == 0) {
+            print_usage(bench_names_str().c_str());
+            return 0;
+        }
+    }
+
     CliOptions options;
     std::string cli_error;
     if (!parse_cli(argc, argv, options, cli_error)) {
         if (cli_error.rfind("Unknown bench", 0) == 0) {
             std::fprintf(stderr, "%s\n", cli_error.c_str());
         } else {
-            std::fprintf(stderr, usage_string(), bench_names_str().c_str());
+            print_usage(bench_names_str().c_str());
         }
         return 1;
     }
@@ -212,6 +238,83 @@ int main(int argc, char** argv) {
     const rt::DeviceId device = devices[0];
     const rt::StreamId stream = runtime->createStream(device);
     printf("Device ready.\n");
+
+    if (options.diag) {
+        struct { const void* buf; int64_t count; } diag_params;
+        constexpr int N = 64;
+        const size_t bytes = N * sizeof(uint64_t);
+
+        std::byte* d_buf = runtime->mallocDevice(device, bytes);
+        printf("diag: device buffer = %p (%zu bytes)\n", (void*)d_buf, bytes);
+
+        // Fill with sentinel on host, copy to device
+        std::vector<uint64_t> h_buf(N, 0xDEADBEEFDEADBEEFULL);
+        runtime->memcpyHostToDevice(stream,
+            reinterpret_cast<const std::byte*>(h_buf.data()), d_buf, bytes);
+        runtime->waitForStream(stream);
+
+        // Read back sentinel to confirm upload works
+        std::vector<uint64_t> h_check(N, 0);
+        runtime->memcpyDeviceToHost(stream, d_buf,
+            reinterpret_cast<std::byte*>(h_check.data()), bytes);
+        runtime->waitForStream(stream);
+        bool upload_ok = true;
+        for (int i = 0; i < N; i++) {
+            if (h_check[i] != 0xDEADBEEFDEADBEEFULL) { upload_ok = false; break; }
+        }
+        printf("diag: upload roundtrip: %s\n", upload_ok ? "OK" : "FAIL");
+
+        // Load and launch diag kernel
+        const std::string kpath = (fs::path(KERNELS_DIR) / "diag.elf").string();
+        printf("diag: loading %s\n", kpath.c_str());
+        const std::vector<std::byte> elf = read_file(kpath);
+        const rt::LoadCodeResult lr = runtime->loadCode(stream, elf.data(), elf.size());
+        runtime->waitForEvent(lr.event_);
+
+        diag_params.buf = d_buf;
+        diag_params.count = N;
+
+        rt::KernelLaunchOptions opts;
+        opts.setShireMask(kShireMask);
+        opts.setBarrier(true);
+        opts.setFlushL3(false);
+
+        printf("diag: launching kernel (buf=%p, count=%ld)\n",
+               diag_params.buf, (long)diag_params.count);
+        runtime->kernelLaunch(stream, lr.kernel_,
+            reinterpret_cast<const std::byte*>(&diag_params),
+            sizeof(diag_params), opts);
+        runtime->waitForStream(stream);
+        check_stream_errors(runtime, stream);
+        printf("diag: kernel done\n");
+
+        // Read back
+        std::vector<uint64_t> h_result(N, 0);
+        runtime->memcpyDeviceToHost(stream, d_buf,
+            reinterpret_cast<std::byte*>(h_result.data()), bytes);
+        runtime->waitForStream(stream);
+
+        int pass = 0, fail = 0;
+        for (int i = 0; i < N; i++) {
+            uint64_t expected = (uint64_t)(i + 1);
+            if (h_result[i] == expected) {
+                pass++;
+            } else {
+                if (fail < 8) {
+                    printf("diag: [%d] got 0x%016lx expected 0x%016lx%s\n",
+                           i, h_result[i], expected,
+                           h_result[i] == 0xDEADBEEFDEADBEEFULL ? " (sentinel)" : "");
+                }
+                fail++;
+            }
+        }
+        printf("diag: %d/%d pass, %d fail\n", pass, N, fail);
+
+        runtime->unloadCode(lr.kernel_);
+        runtime->freeDevice(device, d_buf);
+        runtime->destroyStream(stream);
+        return fail ? 1 : 0;
+    }
 
     const std::string kernel_path = options.kernel_override.empty()
         ? (fs::path(KERNELS_DIR) / (std::string(options.bench->kernel_name) + ".elf")).string()

@@ -16,7 +16,6 @@ find_package(esperantoTrace REQUIRED)
 set(LINKER_SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/sections.ld)
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR})
 
-# ── DRAM Bandwidth Benchmark Kernel ─────────────────────────────────
 add_riscv_executable(dram_bw)
 target_sources(dram_bw.elf PRIVATE dram_bw.c crt.S)
 target_include_directories(dram_bw.elf PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
@@ -26,7 +25,6 @@ target_link_libraries(dram_bw.elf PRIVATE
 )
 set_target_properties(dram_bw.elf PROPERTIES INTERPROCEDURAL_OPTIMIZATION TRUE)
 
-# ── F32 Matrix Multiply Benchmark Kernel ────────────────────────────
 add_riscv_executable(mul_mat_f32)
 target_sources(mul_mat_f32.elf PRIVATE mul_mat_f32.c crt.S)
 target_include_directories(mul_mat_f32.elf PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
@@ -36,7 +34,6 @@ target_link_libraries(mul_mat_f32.elf PRIVATE
 )
 set_target_properties(mul_mat_f32.elf PROPERTIES INTERPROCEDURAL_OPTIMIZATION TRUE)
 
-# ── Q8_0 Matrix Multiply Benchmark Kernel ─────────────────────────
 # The Q8 kernel includes static const data in headers (gather patterns,
 # quantization tables) that need -fdata-sections and -ffat-lto-objects
 # to survive LTO without R_RISCV_HI20 relocation failures at 0x80058xxxxx.
@@ -54,3 +51,12 @@ target_link_libraries(mul_mat_q8.elf PRIVATE
     esperantoTrace::et_trace
 )
 set_target_properties(mul_mat_q8.elf PROPERTIES INTERPROCEDURAL_OPTIMIZATION TRUE)
+
+add_riscv_executable(diag)
+target_sources(diag.elf PRIVATE diag.c crt.S)
+target_include_directories(diag.elf PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_link_libraries(diag.elf PRIVATE
+    et-common-libs::cm-umode
+    esperantoTrace::et_trace
+)
+set_target_properties(diag.elf PROPERTIES INTERPROCEDURAL_OPTIMIZATION TRUE)
