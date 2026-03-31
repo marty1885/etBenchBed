@@ -35,3 +35,22 @@ target_link_libraries(mul_mat_f32.elf PRIVATE
     esperantoTrace::et_trace
 )
 set_target_properties(mul_mat_f32.elf PROPERTIES INTERPROCEDURAL_OPTIMIZATION TRUE)
+
+# ── Q8_0 Matrix Multiply Benchmark Kernel ─────────────────────────
+# The Q8 kernel includes static const data in headers (gather patterns,
+# quantization tables) that need -fdata-sections and -ffat-lto-objects
+# to survive LTO without R_RISCV_HI20 relocation failures at 0x80058xxxxx.
+add_riscv_executable(mul_mat_q8)
+target_sources(mul_mat_q8.elf PRIVATE mul_mat_q8.c crt.S)
+target_include_directories(mul_mat_q8.elf PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_compile_options(mul_mat_q8.elf PRIVATE
+    $<$<COMPILE_LANGUAGE:C>:-ffat-lto-objects>
+    $<$<COMPILE_LANGUAGE:C>:-mcmodel=medany>
+    $<$<COMPILE_LANGUAGE:C>:-fdata-sections>
+    $<$<COMPILE_LANGUAGE:C>:-ffunction-sections>
+)
+target_link_libraries(mul_mat_q8.elf PRIVATE
+    et-common-libs::cm-umode
+    esperantoTrace::et_trace
+)
+set_target_properties(mul_mat_q8.elf PROPERTIES INTERPROCEDURAL_OPTIMIZATION TRUE)

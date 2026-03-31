@@ -10,7 +10,12 @@ endif()
 
 configure_file(Constants.h.in ${CMAKE_CURRENT_BINARY_DIR}/Constants.h)
 
-add_executable(bench_host main.cpp)
+add_executable(bench_host
+    main.cpp
+    bench_registry.cpp
+    benchmark_runner.cpp
+    quant_utils.cpp
+)
 target_include_directories(bench_host PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
 target_compile_features(bench_host PRIVATE cxx_std_17)
 target_link_libraries(bench_host PRIVATE

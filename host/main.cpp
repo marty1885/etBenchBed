@@ -1,132 +1,36 @@
 /*
  * ET-SoC-1 Benchmark Host Program
  *
- * Launches DRAM BW or F32 matmul benchmark kernels on real hardware via PCIe.
- * Supports single-point runs and full sweeps with CSV output.
- *
- * Usage:
- *   bench_host --bench bw  -m 4096 -k 4096 -n 16
- *   bench_host --bench mm  -m 4096 -k 4096 -n 512
- *   bench_host --bench bw  --sweep --csv results.csv
- *   bench_host --bench mm  --sweep --csv results.csv
- *   bench_host --bench mm  -m 256 -k 256 -n 256 --verify
- *   bench_host --bench mm  -m 256 -k 256 -n 256 --seed 123
+ * main() stays script-like, but the bench catalog and non-core helpers live
+ * in a central registry header instead of being smeared across this file.
  */
 
-#include <algorithm>
 #include <chrono>
 #include <cmath>
-#include <cstddef>
-#include <cstdint>
-#include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <cstdio>
 #include <filesystem>
 #include <fstream>
-#include <random>
+#include <memory>
 #include <string>
 #include <vector>
-
-#include <cblas.h>
 
 #include <device-layer/IDeviceLayer.h>
 #include <runtime/IRuntime.h>
 #include <runtime/Types.h>
 
+#include "benchmark_runner.h"
 #include "Constants.h"
+#include "bench_registry.h"
 
 namespace fs = std::filesystem;
+using namespace hostbench;
 
-struct et_sgemm_params {
-    int64_t M, N, K;
-    const void* A;   int64_t lda;
-    const void* B;   int64_t ldb;
-    void*       C;   int64_t ldc;
-    int64_t batch_count;
-    int64_t stride_A, stride_B, stride_C;
-};
+namespace {
 
-struct et_bw_params {
-    const void* src0;  int64_t src0_bytes;
-    const void* src1;  int64_t src1_bytes;
-};
-
-struct TestPoint {
-    int m;
-    int k;
-    int n;
-};
-
-struct BenchResult {
-    double us_per_run;
-    double gflops;
-    double bw_gbs;
-    double bytes_read;
-    int num_runs;
-    int num_batches;
-};
-
-static std::vector<std::byte> readFile(const std::string& path) {
-    std::ifstream file(path, std::ios::binary | std::ios::ate);
-    if (!file) {
-        fprintf(stderr, "Cannot open: %s\n", path.c_str());
-        std::exit(1);
-    }
-
-    const std::streamsize size = file.tellg();
-    file.seekg(0, std::ios::beg);
-
-    std::vector<std::byte> buffer(static_cast<size_t>(size));
-    file.read(reinterpret_cast<char*>(buffer.data()), size);
-    return buffer;
-}
-
-static std::vector<TestPoint> bw_sweep_points() {
-    std::vector<TestPoint> points;
-
-    std::vector<int> mk_vals = {16, 32};
-    for (int value = 64; value <= 8192; value += 64) {
-        mk_vals.push_back(value);
-    }
-
-    std::vector<int> n_vals = {16, 32, 64};
-    for (int value = 128; value <= 8192; value += 128) {
-        n_vals.push_back(value);
-    }
-
-    for (int mk : mk_vals) {
-        for (int n : n_vals) {
-            points.push_back({mk, mk, n});
-        }
-    }
-
-    return points;
-}
-
-static std::vector<TestPoint> mm_sweep_points() {
-    return {
-        {4096, 4096, 1}, {4096, 4096, 2}, {4096, 4096, 4},
-        {4096, 11008, 1}, {4096, 11008, 4},
-        {4096, 4096, 16}, {4096, 4096, 32}, {4096, 4096, 64},
-        {4096, 11008, 16},
-        {4096, 4096, 128}, {4096, 4096, 256}, {4096, 4096, 512},
-        {2048, 2048, 1}, {2048, 2048, 16}, {2048, 5504, 1},
-        {8192, 8192, 1}, {8192, 8192, 16},
-        {2496, 2496, 16}, {3072, 3072, 16},
-        {4096, 14336, 1}, {4096, 14336, 16},
-    };
-}
-
-int main(int argc, char** argv) {
-    enum BenchType { BW, MM };
-
-    constexpr double MIN_TOTAL_US = 500000.0;
-    constexpr int MAX_RUNS = 50000;
-    constexpr int INITIAL_BATCH_RUNS = 32;
-    constexpr int MAX_BATCH_RUNS = 4096;
-    constexpr uint64_t SHIRE_MASK = 0xFFFFFFFF;
-
-    BenchType bench_type = BW;
+struct CliOptions {
+    const BenchDesc* bench = default_bench();
     bool sweep = false;
     bool verify = false;
     int M = 4096;
@@ -138,51 +42,160 @@ int main(int argc, char** argv) {
     unsigned seed = 42;
     bool custom_seed = false;
     std::string kernel_override;
+};
 
+struct AllocationPlan {
+    int64_t max_mk = 0;
+    int64_t max_nk = 0;
+    int64_t max_mn = 0;
+    int64_t max_m = 0;
+    int64_t max_k = 0;
+    size_t src0_bytes = 0;
+    size_t src1_bytes = 0;
+    size_t dst_bytes = 0;
+};
+
+bool parse_cli(int argc, char** argv, CliOptions& options, std::string& error) {
     for (int i = 1; i < argc; ++i) {
-        if (!std::strcmp(argv[i], "--bench") && i + 1 < argc) {
-            ++i;
-            if (!std::strcmp(argv[i], "bw")) {
-                bench_type = BW;
-            } else if (!std::strcmp(argv[i], "mm")) {
-                bench_type = MM;
-            } else {
-                fprintf(stderr, "Unknown bench: %s\n", argv[i]);
-                return 1;
+        if (std::strcmp(argv[i], "--bench") == 0 && i + 1 < argc) {
+            options.bench = find_bench(argv[++i]);
+            if (!options.bench) {
+                error = "Unknown bench '" + std::string(argv[i]) + "'. Available: " + bench_names_str();
+                return false;
             }
-        } else if (!std::strcmp(argv[i], "--sweep")) {
-            sweep = true;
-        } else if (!std::strcmp(argv[i], "--verify")) {
-            verify = true;
-        } else if (!std::strcmp(argv[i], "-m") && i + 1 < argc) {
-            M = std::atoi(argv[++i]);
-        } else if (!std::strcmp(argv[i], "-k") && i + 1 < argc) {
-            K = std::atoi(argv[++i]);
-        } else if (!std::strcmp(argv[i], "-n") && i + 1 < argc) {
-            N = std::atoi(argv[++i]);
-        } else if (!std::strcmp(argv[i], "--runs") && i + 1 < argc) {
-            min_runs = std::atoi(argv[++i]);
-        } else if (!std::strcmp(argv[i], "--warmup") && i + 1 < argc) {
-            warmup_runs = std::atoi(argv[++i]);
-        } else if (!std::strcmp(argv[i], "--csv") && i + 1 < argc) {
-            csv_path = argv[++i];
-        } else if (!std::strcmp(argv[i], "--kernel") && i + 1 < argc) {
-            kernel_override = argv[++i];
-        } else if (!std::strcmp(argv[i], "--seed") && i + 1 < argc) {
-            seed = static_cast<unsigned>(std::strtoul(argv[++i], nullptr, 0));
-            custom_seed = true;
+        } else if (std::strcmp(argv[i], "--sweep") == 0) {
+            options.sweep = true;
+        } else if (std::strcmp(argv[i], "--verify") == 0) {
+            options.verify = true;
+        } else if (std::strcmp(argv[i], "-m") == 0 && i + 1 < argc) {
+            options.M = std::atoi(argv[++i]);
+        } else if (std::strcmp(argv[i], "-k") == 0 && i + 1 < argc) {
+            options.K = std::atoi(argv[++i]);
+        } else if (std::strcmp(argv[i], "-n") == 0 && i + 1 < argc) {
+            options.N = std::atoi(argv[++i]);
+        } else if (std::strcmp(argv[i], "--runs") == 0 && i + 1 < argc) {
+            options.min_runs = std::atoi(argv[++i]);
+        } else if (std::strcmp(argv[i], "--warmup") == 0 && i + 1 < argc) {
+            options.warmup_runs = std::atoi(argv[++i]);
+        } else if (std::strcmp(argv[i], "--csv") == 0 && i + 1 < argc) {
+            options.csv_path = argv[++i];
+        } else if (std::strcmp(argv[i], "--kernel") == 0 && i + 1 < argc) {
+            options.kernel_override = argv[++i];
+        } else if (std::strcmp(argv[i], "--seed") == 0 && i + 1 < argc) {
+            options.seed = static_cast<unsigned>(std::strtoul(argv[++i], nullptr, 0));
+            options.custom_seed = true;
         } else {
-            fprintf(stderr,
-                    "Usage: bench_host --bench bw|mm [-m M -k K -n N] [--sweep] "
-                    "[--verify] [--runs N] [--warmup N] [--csv FILE] [--kernel ELF] "
-                    "[--seed SEED]\n");
-            return 1;
+            error = "Invalid arguments";
+            return false;
         }
     }
+    return true;
+}
 
-    if (verify && bench_type != MM) {
-        fprintf(stderr, "--verify is only supported with --bench mm\n");
+const char* usage_string() {
+    return "Usage: bench_host --bench %s [-m M -k K -n N] [--sweep] [--verify] "
+           "[--runs N] [--warmup N] [--csv FILE] [--kernel ELF] [--seed SEED]\n";
+}
+
+std::vector<std::byte> read_file(const std::string& path) {
+    std::ifstream file(path, std::ios::binary | std::ios::ate);
+    if (!file) {
+        fprintf(stderr, "Cannot open: %s\n", path.c_str());
+        std::exit(1);
+    }
+    const std::streamsize size = file.tellg();
+    file.seekg(0, std::ios::beg);
+    std::vector<std::byte> buffer(static_cast<size_t>(size));
+    file.read(reinterpret_cast<char*>(buffer.data()), size);
+    return buffer;
+}
+
+std::vector<TestPoint> build_points(const CliOptions& options) {
+    if (options.sweep) {
+        return options.bench->sweep_points();
+    }
+    return {{options.M, options.K, options.N}};
+}
+
+AllocationPlan plan_allocations(const std::vector<TestPoint>& points, const BenchDesc& bench) {
+    AllocationPlan plan;
+    for (const TestPoint& point : points) {
+        plan.max_mk = std::max(plan.max_mk, static_cast<int64_t>(point.m) * point.k);
+        plan.max_nk = std::max(plan.max_nk, static_cast<int64_t>(point.n) * point.k);
+        plan.max_mn = std::max(plan.max_mn, static_cast<int64_t>(point.m) * point.n);
+        plan.max_m = std::max(plan.max_m, static_cast<int64_t>(point.m));
+        plan.max_k = std::max(plan.max_k, static_cast<int64_t>(point.k));
+    }
+
+    if (bench.kind == BenchKind::Matmul && bench.src_format->is_quantized()) {
+        plan.src0_bytes = static_cast<size_t>(plan.max_m) * bench.src_format->row_bytes(static_cast<int>(plan.max_k));
+    } else {
+        plan.src0_bytes = static_cast<size_t>(plan.max_mk) * sizeof(float);
+    }
+    plan.src1_bytes = static_cast<size_t>(plan.max_nk) * sizeof(float);
+    plan.dst_bytes = static_cast<size_t>(plan.max_mn) * sizeof(float);
+    return plan;
+}
+
+FILE* open_csv(const CliOptions& options, const BenchDesc& bench) {
+    if (options.csv_path.empty()) {
+        return nullptr;
+    }
+    FILE* csv = fopen(options.csv_path.c_str(), "w");
+    if (!csv) {
+        fprintf(stderr, "Cannot open CSV: %s\n", options.csv_path.c_str());
+        return nullptr;
+    }
+    if (bench.perf_mode.csv_header) {
+        fputs(bench.perf_mode.csv_header, csv);
+    }
+    return csv;
+}
+
+void write_csv_row(FILE* csv, const BenchDesc& bench, const TestPoint& point, const BenchResult& result) {
+    if (!csv) {
+        return;
+    }
+    if (bench.kind == BenchKind::Bandwidth) {
+        fprintf(
+            csv, "%d,%d,%d,%.0f,%.2f,%.4f,%d\n",
+            point.m, point.k, point.n,
+            result.bytes_read, result.us_per_run, result.bw_gbs, result.num_runs);
+        return;
+    }
+    const double mflops = 2.0 * point.m * point.n * point.k / 1e6;
+    fprintf(
+        csv, "%d,%d,%d,%.2f,%.2f,%.2f,%.2f,%d\n",
+        point.m, point.k, point.n,
+        result.us_per_run, mflops, result.gflops, result.bw_gbs, result.num_runs);
+}
+
+}  // namespace
+
+int main(int argc, char** argv) {
+    CliOptions options;
+    std::string cli_error;
+    if (!parse_cli(argc, argv, options, cli_error)) {
+        if (cli_error.rfind("Unknown bench", 0) == 0) {
+            std::fprintf(stderr, "%s\n", cli_error.c_str());
+        } else {
+            std::fprintf(stderr, usage_string(), bench_names_str().c_str());
+        }
         return 1;
+    }
+
+    const RunMode run_mode = options.verify ? RunMode::Verify : RunMode::Perf;
+    if (!supports_mode(*options.bench, run_mode)) {
+        std::fprintf(stderr, "--verify is not supported with --bench %s\n", options.bench->cli_name);
+        return 1;
+    }
+
+    if (options.bench->validate) {
+        const char* err = options.bench->validate(options.M, options.K, options.N);
+        if (err) {
+            std::fprintf(stderr, "%s\n", err);
+            return 1;
+        }
     }
 
     printf("Initializing PCIe device...\n");
@@ -192,7 +205,7 @@ int main(int argc, char** argv) {
 
     const std::vector<rt::DeviceId> devices = runtime->getDevices();
     if (devices.empty()) {
-        fprintf(stderr, "No ET devices found\n");
+        std::fprintf(stderr, "No ET devices found\n");
         return 1;
     }
 
@@ -200,102 +213,62 @@ int main(int argc, char** argv) {
     const rt::StreamId stream = runtime->createStream(device);
     printf("Device ready.\n");
 
-    const char* kernel_name = (bench_type == BW) ? "dram_bw" : "mul_mat_f32";
-    const std::string kernel_path = kernel_override.empty()
-        ? (fs::path(KERNELS_DIR) / (std::string(kernel_name) + ".elf")).string()
-        : kernel_override;
+    const std::string kernel_path = options.kernel_override.empty()
+        ? (fs::path(KERNELS_DIR) / (std::string(options.bench->kernel_name) + ".elf")).string()
+        : options.kernel_override;
 
     printf("Loading kernel: %s\n", kernel_path.c_str());
-    const std::vector<std::byte> elf_data = readFile(kernel_path);
+    const std::vector<std::byte> elf_data = read_file(kernel_path);
     const rt::LoadCodeResult load_result =
         runtime->loadCode(stream, elf_data.data(), elf_data.size());
     runtime->waitForEvent(load_result.event_);
     const rt::KernelId kernel = load_result.kernel_;
-    printf("Kernel loaded: %s\n", kernel_name);
+    printf("Kernel loaded: %s\n", options.bench->kernel_name);
 
-    std::vector<TestPoint> points;
-    if (sweep) {
-        points = (bench_type == BW) ? bw_sweep_points() : mm_sweep_points();
-    } else {
-        points.push_back({M, K, N});
+    const std::vector<TestPoint> points = build_points(options);
+    const AllocationPlan allocation = plan_allocations(points, *options.bench);
+
+    if (options.custom_seed) {
+        printf("Using custom seed: %u\n", options.seed);
     }
+    printf(
+        "Allocating: src0=%.1fMB src1=%.1fMB dst=%.1fMB\n",
+        allocation.src0_bytes / 1e6,
+        allocation.src1_bytes / 1e6,
+        allocation.dst_bytes / 1e6);
 
-    int64_t max_mk = 0;
-    int64_t max_nk = 0;
-    int64_t max_mn = 0;
-    for (const TestPoint& p : points) {
-        max_mk = std::max(max_mk, static_cast<int64_t>(p.m) * p.k);
-        max_nk = std::max(max_nk, static_cast<int64_t>(p.n) * p.k);
-        max_mn = std::max(max_mn, static_cast<int64_t>(p.m) * p.n);
-    }
-
-    const size_t src0_bytes = static_cast<size_t>(max_mk * sizeof(float));
-    const size_t src1_bytes = static_cast<size_t>(max_nk * sizeof(float));
-    const size_t dst_bytes = static_cast<size_t>(max_mn * sizeof(float));
-
-    if (custom_seed) {
-        printf("Using custom seed: %u\n", seed);
-    }
-
-    printf("Allocating: src0=%.1fMB src1=%.1fMB dst=%.1fMB\n",
-           src0_bytes / 1e6,
-           src1_bytes / 1e6,
-           dst_bytes / 1e6);
-
-    std::byte* d_src0 = runtime->mallocDevice(device, src0_bytes);
-    std::byte* d_src1 = runtime->mallocDevice(device, src1_bytes);
-    std::byte* d_dst = runtime->mallocDevice(device, dst_bytes);
-
-    std::vector<float> h_A;
-    std::vector<float> h_B;
-    {
-        std::mt19937 rng(seed);
-        std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
-
-        std::vector<float> a_data(max_mk);
-        for (float& value : a_data) {
-            value = dist(rng);
-        }
-        runtime->memcpyHostToDevice(stream,
-                                    reinterpret_cast<const std::byte*>(a_data.data()),
-                                    d_src0,
-                                    src0_bytes);
-
-        std::vector<float> b_data(max_nk);
-        for (float& value : b_data) {
-            value = dist(rng);
-        }
-        runtime->memcpyHostToDevice(stream,
-                                    reinterpret_cast<const std::byte*>(b_data.data()),
-                                    d_src1,
-                                    src1_bytes);
-
-        runtime->waitForStream(stream);
-
-        if (verify) {
-            h_A = std::move(a_data);
-            h_B = std::move(b_data);
-        }
-    }
+    DeviceBuffers device_buffers = {
+        runtime->mallocDevice(device, allocation.src0_bytes),
+        runtime->mallocDevice(device, allocation.src1_bytes),
+        runtime->mallocDevice(device, allocation.dst_bytes),
+    };
+    HostData host_data = initialize_host_data(
+        runtime,
+        stream,
+        device_buffers,
+        allocation.max_mk,
+        allocation.max_nk,
+        allocation.max_m,
+        allocation.max_k,
+        allocation.src0_bytes,
+        allocation.src1_bytes,
+        *options.bench,
+        options.verify,
+        options.seed);
 
     rt::KernelLaunchOptions opts;
-    opts.setShireMask(SHIRE_MASK);
+    opts.setShireMask(kShireMask);
     opts.setBarrier(true);
     opts.setFlushL3(false);
 
-    FILE* csv = nullptr;
-    if (!csv_path.empty()) {
-        csv = fopen(csv_path.c_str(), "w");
-        if (!csv) {
-            fprintf(stderr, "Cannot open CSV: %s\n", csv_path.c_str());
-            return 1;
-        }
-
-        if (bench_type == BW) {
-            fprintf(csv, "M,K,N,BYTES_READ,US_PER_RUN,BW_GB_S,RUNS\n");
-        } else {
-            fprintf(csv, "M,K,N,US_PER_RUN,MFLOPS,GFLOPS,BW_GB_S,RUNS\n");
-        }
+    FILE* csv = open_csv(options, *options.bench);
+    if (!options.csv_path.empty() && !csv) {
+        runtime->freeDevice(device, device_buffers.src0);
+        runtime->freeDevice(device, device_buffers.src1);
+        runtime->freeDevice(device, device_buffers.dst);
+        runtime->unloadCode(kernel);
+        runtime->destroyStream(stream);
+        return 1;
     }
 
     const int total = static_cast<int>(points.size());
@@ -303,303 +276,126 @@ int main(int argc, char** argv) {
     int verify_fail = 0;
     const auto t_start = std::chrono::steady_clock::now();
 
-    printf("\nRunning %d test points (%s%s):\n\n",
-           total,
-           (bench_type == BW) ? "BW" : "MM",
-           verify ? ", verify" : "");
+    printf(
+        "\nRunning %d test points (%s%s):\n\n",
+        total,
+        options.bench->label,
+        options.verify ? ", verify" : "");
 
     for (int idx = 0; idx < total; ++idx) {
         const TestPoint& p = points[idx];
 
-        if (verify) {
-            et_sgemm_params params = {};
-            params.M = p.m;
-            params.N = p.n;
-            params.K = p.k;
-            params.A = d_src0;
-            params.lda = static_cast<int64_t>(p.k) * sizeof(float);
-            params.B = d_src1;
-            params.ldb = static_cast<int64_t>(p.k) * sizeof(float);
-            params.C = d_dst;
-            params.ldc = static_cast<int64_t>(p.m) * sizeof(float);
-            params.batch_count = 1;
+        const LaunchSpec launch_spec = build_launch_spec(p, *options.bench, device_buffers);
 
-            runtime->kernelLaunch(stream,
-                                  kernel,
-                                  reinterpret_cast<const std::byte*>(&params),
-                                  sizeof(params),
-                                  opts);
-            runtime->waitForStream(stream);
+        if (options.verify) {
+            const VerifyResult verify_result = run_verify(
+                runtime, stream, kernel, opts, *options.bench, p, launch_spec, device_buffers, host_data);
+            verify_result.pass ? ++verify_pass : ++verify_fail;
 
-            const size_t c_elems = static_cast<size_t>(p.m) * p.n;
-            std::vector<float> h_C_dev(c_elems);
-            runtime->memcpyDeviceToHost(stream,
-                                        d_dst,
-                                        reinterpret_cast<std::byte*>(h_C_dev.data()),
-                                        c_elems * sizeof(float));
-            runtime->waitForStream(stream);
-
-            std::vector<float> h_C_ref(c_elems, 0.0f);
-            cblas_sgemm(CblasRowMajor,
-                        CblasNoTrans,
-                        CblasTrans,
-                        p.n,
-                        p.m,
-                        p.k,
-                        1.0f,
-                        h_B.data(),
-                        p.k,
-                        h_A.data(),
-                        p.k,
-                        0.0f,
-                        h_C_ref.data(),
-                        p.m);
-
-            const float rel_tol = std::sqrt(static_cast<float>(p.k)) * 1e-5f;
-            const float abs_tol = rel_tol;
-            float max_abs = 0.0f;
-            float max_rel = 0.0f;
-            float max_violation = 0.0f;
-            int worst_abs_idx = 0;
-            int worst_rel_idx = 0;
-            int worst_violation_idx = 0;
-            for (size_t i = 0; i < c_elems; ++i) {
-                const float diff = std::fabs(h_C_dev[i] - h_C_ref[i]);
-                const float mag = std::fabs(h_C_ref[i]);
-                if (diff > max_abs) {
-                    max_abs = diff;
-                    worst_abs_idx = static_cast<int>(i);
-                }
-
-                const float rel = (mag > 0.0f) ? diff / mag : 0.0f;
-                if (rel > max_rel) {
-                    max_rel = rel;
-                    worst_rel_idx = static_cast<int>(i);
-                }
-
-                const float allowed = abs_tol + rel_tol * mag;
-                const float violation = diff / allowed;
-                if (violation > max_violation) {
-                    max_violation = violation;
-                    worst_violation_idx = static_cast<int>(i);
-                }
-            }
-
-            const bool pass = max_violation <= 1.0f;
-            if (pass) {
-                ++verify_pass;
-            } else {
-                ++verify_fail;
-            }
-
-            printf("  [%d/%d]  M=%5d K=%5d N=%4d  %s  "
-                   "max_abs=%.3e max_rel=%.3e max_v=%.3e (atol=%.1e rtol=%.1e)\n",
-                   idx + 1,
-                   total,
-                   p.m,
-                   p.k,
-                   p.n,
-                   pass ? "PASS" : "FAIL",
-                   max_abs,
-                   max_rel,
-                   max_violation,
-                   abs_tol,
-                   rel_tol);
-            if (!pass) {
-                printf("           worst_abs @ %d: device=%.6e ref=%.6e\n",
-                       worst_abs_idx,
-                       h_C_dev[worst_abs_idx],
-                       h_C_ref[worst_abs_idx]);
-                printf("           worst_rel @ %d: device=%.6e ref=%.6e\n",
-                       worst_rel_idx,
-                       h_C_dev[worst_rel_idx],
-                       h_C_ref[worst_rel_idx]);
-                printf("           worst_v   @ %d: device=%.6e ref=%.6e\n",
-                       worst_violation_idx,
-                       h_C_dev[worst_violation_idx],
-                       h_C_ref[worst_violation_idx]);
+            printf(
+                "  [%d/%d]  M=%5d K=%5d N=%4d  %s  max_abs=%.6f max_rel=%.6f "
+                "max_v=%.4f (atol=%.6f rtol=%.6f)\n",
+                idx + 1,
+                total,
+                p.m,
+                p.k,
+                p.n,
+                verify_result.pass ? "PASS" : "FAIL",
+                verify_result.max_abs,
+                verify_result.max_rel,
+                verify_result.max_violation,
+                verify_result.abs_tol,
+                verify_result.rel_tol);
+            if (!verify_result.pass) {
+                printf(
+                    "           worst_abs @ %d: device=%.6f ref=%.6f diff=%.6f\n",
+                    verify_result.worst_abs_idx,
+                    verify_result.h_C_dev[verify_result.worst_abs_idx],
+                    verify_result.h_C_ref[verify_result.worst_abs_idx],
+                    verify_result.h_C_dev[verify_result.worst_abs_idx] -
+                        verify_result.h_C_ref[verify_result.worst_abs_idx]);
+                printf(
+                    "           worst_rel @ %d: device=%.6f ref=%.6f rel=%.6f\n",
+                    verify_result.worst_rel_idx,
+                    verify_result.h_C_dev[verify_result.worst_rel_idx],
+                    verify_result.h_C_ref[verify_result.worst_rel_idx],
+                    std::fabs(verify_result.h_C_ref[verify_result.worst_rel_idx]) > 0.0f
+                        ? std::fabs(
+                              verify_result.h_C_dev[verify_result.worst_rel_idx] -
+                              verify_result.h_C_ref[verify_result.worst_rel_idx]) /
+                              std::fabs(verify_result.h_C_ref[verify_result.worst_rel_idx])
+                        : 0.0f);
+                printf(
+                    "           worst_v   @ %d: device=%.6f ref=%.6f violation=%.4f\n",
+                    verify_result.worst_violation_idx,
+                    verify_result.h_C_dev[verify_result.worst_violation_idx],
+                    verify_result.h_C_ref[verify_result.worst_violation_idx],
+                    verify_result.max_violation);
             }
             continue;
         }
 
-        BenchResult out = {};
-        auto measure_batched = [&](const void* params, size_t params_size) {
-            if (warmup_runs > 0) {
-                for (int warmup = 0; warmup < warmup_runs; ++warmup) {
-                    runtime->kernelLaunch(
-                        stream,
-                        kernel,
-                        reinterpret_cast<const std::byte*>(params),
-                        params_size,
-                        opts);
-                }
-                runtime->waitForStream(stream);
-            }
-
-            double total_us = 0.0;
-            int total_runs_measured = 0;
-            int batch_count = 0;
-            int next_batch_runs = std::max(min_runs, INITIAL_BATCH_RUNS);
-
-            while (total_runs_measured < min_runs || total_us < MIN_TOTAL_US) {
-                if (total_runs_measured >= MAX_RUNS) {
-                    break;
-                }
-
-                int batch_runs =
-                    std::min(next_batch_runs, MAX_RUNS - total_runs_measured);
-                batch_runs = std::max(batch_runs, 1);
-
-                const auto t0 = std::chrono::high_resolution_clock::now();
-                for (int run = 0; run < batch_runs; ++run) {
-                    runtime->kernelLaunch(
-                        stream,
-                        kernel,
-                        reinterpret_cast<const std::byte*>(params),
-                        params_size,
-                        opts);
-                }
-                runtime->waitForStream(stream);
-                const auto t1 = std::chrono::high_resolution_clock::now();
-
-                total_us +=
-                    std::chrono::duration<double, std::micro>(t1 - t0).count();
-                total_runs_measured += batch_runs;
-                ++batch_count;
-
-                if (total_us < MIN_TOTAL_US && total_runs_measured < MAX_RUNS) {
-                    const double avg_us =
-                        total_us / std::max(total_runs_measured, 1);
-                    const double remaining_us = MIN_TOTAL_US - total_us;
-                    const int runs_for_time = static_cast<int>(
-                        std::ceil(remaining_us / std::max(avg_us, 1.0)));
-                    const int runs_for_min = min_runs - total_runs_measured;
-                    next_batch_runs = std::max({1, runs_for_time, runs_for_min});
-                    next_batch_runs =
-                        std::min(next_batch_runs, MAX_BATCH_RUNS);
-                }
-            }
-
-            out.us_per_run = total_us / std::max(total_runs_measured, 1);
-            out.num_runs = total_runs_measured;
-            out.num_batches = batch_count;
-        };
-
-        if (bench_type == MM) {
-            et_sgemm_params params = {};
-            params.M = p.m;
-            params.N = p.n;
-            params.K = p.k;
-            params.A = d_src0;
-            params.lda = static_cast<int64_t>(p.k) * sizeof(float);
-            params.B = d_src1;
-            params.ldb = static_cast<int64_t>(p.k) * sizeof(float);
-            params.C = d_dst;
-            params.ldc = static_cast<int64_t>(p.m) * sizeof(float);
-            params.batch_count = 1;
-
-            measure_batched(&params, sizeof(params));
-            const double bytes =
-                static_cast<double>(static_cast<int64_t>(p.m) * p.k +
-                                    static_cast<int64_t>(p.n) * p.k) *
-                sizeof(float);
-            const double flops = 2.0 * p.m * p.n * p.k;
-
-            out.gflops = flops / (out.us_per_run * 1e-6) / 1e9;
-            out.bw_gbs = bytes / (out.us_per_run * 1e-6) / 1e9;
-            out.bytes_read = bytes;
-        } else {
-            et_bw_params params = {};
-            params.src0 = d_src0;
-            params.src0_bytes = static_cast<int64_t>(p.m) * p.k * sizeof(float);
-            params.src1 = d_src1;
-            params.src1_bytes = static_cast<int64_t>(p.n) * p.k * sizeof(float);
-
-            measure_batched(&params, sizeof(params));
-            const double bytes =
-                static_cast<double>(params.src0_bytes + params.src1_bytes);
-
-            out.gflops = 0.0;
-            out.bw_gbs = bytes / (out.us_per_run * 1e-6) / 1e9;
-            out.bytes_read = bytes;
-        }
+        const BenchResult result = run_perf(
+            runtime,
+            stream,
+            kernel,
+            opts,
+            *options.bench,
+            p,
+            launch_spec,
+            options.min_runs,
+            options.warmup_runs);
 
         const auto elapsed = std::chrono::steady_clock::now() - t_start;
         const double elapsed_s = std::chrono::duration<double>(elapsed).count();
         const double rate = (idx + 1) / elapsed_s;
         const double eta_s = (total - idx - 1) / std::max(rate, 0.001);
 
-        if (bench_type == BW) {
-            printf("  [%d/%d %.0fs ETA %.0fs]  M=%5d K=%5d N=%5d  "
-                   "%6.1fMB  %8.1fus  %6.2f GB/s  (%d runs, %d batches)\n",
-                   idx + 1,
-                   total,
-                   elapsed_s,
-                   eta_s,
-                   p.m,
-                   p.k,
-                   p.n,
-                   out.bytes_read / 1e6,
-                   out.us_per_run,
-                   out.bw_gbs,
-                   out.num_runs,
-                   out.num_batches);
-            if (csv) {
-                fprintf(csv,
-                        "%d,%d,%d,%.0f,%.2f,%.4f,%d\n",
-                        p.m,
-                        p.k,
-                        p.n,
-                        out.bytes_read,
-                        out.us_per_run,
-                        out.bw_gbs,
-                        out.num_runs);
-            }
+        if (options.bench->kind == BenchKind::Bandwidth) {
+            printf(
+                "  [%d/%d %.0fs ETA %.0fs]  M=%5d K=%5d N=%5d  %6.1fMB  %8.1fus  "
+                "%6.2f GB/s  (%d runs, %d batches)\n",
+                idx + 1,
+                total,
+                elapsed_s,
+                eta_s,
+                p.m,
+                p.k,
+                p.n,
+                result.bytes_read / 1e6,
+                result.us_per_run,
+                result.bw_gbs,
+                result.num_runs,
+                result.num_batches);
         } else {
-            printf("  [%d/%d %.0fs ETA %.0fs]  M=%5d K=%5d N=%4d  "
-                   "%7.1f GFLOPS  %5.1f GB/s  (%d runs, %d batches)\n",
-                   idx + 1,
-                   total,
-                   elapsed_s,
-                   eta_s,
-                   p.m,
-                   p.k,
-                   p.n,
-                   out.gflops,
-                   out.bw_gbs,
-                   out.num_runs,
-                   out.num_batches);
-            if (csv) {
-                const double mflops = 2.0 * p.m * p.n * p.k / 1e6;
-                fprintf(csv,
-                        "%d,%d,%d,%.2f,%.2f,%.2f,%.2f,%d\n",
-                        p.m,
-                        p.k,
-                        p.n,
-                        out.us_per_run,
-                        mflops,
-                        out.gflops,
-                        out.bw_gbs,
-                        out.num_runs);
-            }
+            printf(
+                "  [%d/%d %.0fs ETA %.0fs]  M=%5d K=%5d N=%4d  %7.1f GFLOPS  %5.1f GB/s  "
+                "(%d runs, %d batches)\n",
+                idx + 1,
+                total,
+                elapsed_s,
+                eta_s,
+                p.m,
+                p.k,
+                p.n,
+                result.gflops,
+                result.bw_gbs,
+                result.num_runs,
+                result.num_batches);
         }
 
-        if (csv) {
-            fflush(csv);
-        }
+        write_csv_row(csv, *options.bench, p, result);
+        if (csv) fflush(csv);
     }
 
-    if (csv) {
-        fclose(csv);
-    }
-
-    runtime->freeDevice(device, d_src0);
-    runtime->freeDevice(device, d_src1);
-    runtime->freeDevice(device, d_dst);
+    if (csv) fclose(csv);
+    runtime->freeDevice(device, device_buffers.src0);
+    runtime->freeDevice(device, device_buffers.src1);
+    runtime->freeDevice(device, device_buffers.dst);
     runtime->unloadCode(kernel);
     runtime->destroyStream(stream);
 
-    if (verify) {
+    if (options.verify) {
         printf("\nVerify: %d passed, %d failed.\n", verify_pass, verify_fail);
     } else {
         printf("\nDone. %d points measured.\n", total);
