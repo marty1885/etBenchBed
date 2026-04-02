@@ -229,8 +229,9 @@ BenchResult run_perf(rt::RuntimePtr& runtime,
     int total_runs = 0;
     int batch_count = 0;
     int next_batch = std::max(min_runs, kInitialBatchRuns);
+    double effective_min_us = kMinTotalUs;
 
-    while (total_runs < min_runs || total_us < kMinTotalUs) {
+    while (total_runs < min_runs || total_us < effective_min_us) {
         if (total_runs >= kMaxRuns) {
             break;
         }
@@ -254,9 +255,22 @@ BenchResult run_perf(rt::RuntimePtr& runtime,
         total_runs += batch;
         ++batch_count;
 
-        if (total_us < kMinTotalUs && total_runs < kMaxRuns) {
+        // After first batch, adapt the time target: long-running (memory-bound)
+        // kernels don't need thousands of runs for stable timing.  Scale the
+        // target so that we aim for ~64 runs when each run exceeds 5ms, while
+        // keeping the full budget for very fast kernels.
+        if (batch_count == 1) {
             const double avg = total_us / std::max(total_runs, 1);
-            const int need_time = static_cast<int>(std::ceil((kMinTotalUs - total_us) / std::max(avg, 1.0)));
+            // Floor at 64 runs worth of time, cap at kMinTotalUs
+            const double runs_target_us = avg * 64.0;
+            if (runs_target_us < kMinTotalUs) {
+                effective_min_us = std::max(runs_target_us, 50000.0);  // at least 50ms
+            }
+        }
+
+        if (total_us < effective_min_us && total_runs < kMaxRuns) {
+            const double avg = total_us / std::max(total_runs, 1);
+            const int need_time = static_cast<int>(std::ceil((effective_min_us - total_us) / std::max(avg, 1.0)));
             const int need_min = min_runs - total_runs;
             next_batch = std::min(std::max({1, need_time, need_min}), kMaxBatchRuns);
         }
