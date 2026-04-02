@@ -48,6 +48,11 @@ std::vector<TestPoint> q8_sweep_points() {
         {8192, 8192}, {8192, 28672},
         {2048, 2048}, {2048, 5504},
         {2496, 2496}, {3072, 3072},
+        /* Qwen/Gemma down_proj shapes (K-split + non-LLaMA M) */
+        {3584, 18944}, {2048, 16384}, {2048, 11008}, {1536, 8960},
+        /* Gemma 3 shapes — unusual K values, small M for KV proj */
+        {2560, 10240}, {10240, 2560}, {3840, 15360}, {15360, 3840},
+        {1152, 6144}, {6144, 1152}, {256, 1152}, {1024, 2560},
     };
     const int n_vals[] = {1, 2, 4, 8, 16, 32, 64, 128, 256, 512};
     for (const auto& dims : mk) {

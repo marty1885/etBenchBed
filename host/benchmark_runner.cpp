@@ -39,7 +39,7 @@ HostData initialize_host_data(rt::RuntimePtr& runtime,
     std::mt19937 rng(seed);
     std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
 
-    std::vector<float> a_f32(max_mk);
+    std::vector<float> a_f32(static_cast<size_t>(max_m) * max_k);
     for (float& value : a_f32) {
         value = dist(rng);
     }
@@ -63,7 +63,7 @@ HostData initialize_host_data(rt::RuntimePtr& runtime,
             src0_bytes);
 
         if (verify) {
-            host_data.h_A.resize(max_mk);
+            host_data.h_A.resize(static_cast<size_t>(max_m) * max_k);
             for (int64_t row = 0; row < max_m; ++row) {
                 format->dequantize_row(
                     host_data.h_A_raw.data() + row * row_bytes,
