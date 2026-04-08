@@ -10,6 +10,19 @@
 #include "math_fp.h"
 #include "quants.h"
 
+typedef struct {
+    unsigned long saved_mask;
+} q8_dot_state;
+
+static inline void q8_dot_begin(q8_dot_state* state) {
+    __asm__ volatile("mova.x.m %0" : "=r"(state->saved_mask));
+    __asm__ volatile("mov.m.x m0, x0, 0xFF");
+}
+
+static inline void q8_dot_end(const q8_dot_state* state) {
+    __asm__ volatile("mova.m.x %0" :: "r"(state->saved_mask));
+}
+
 // Compute full-row dot product: sum over K_blocks Q8_0 blocks against F32 vector.
 // Hoists mask save/restore and gather pattern load outside the block loop.
 // Accumulates scaled partial products in a vector register and does a single
@@ -17,16 +30,17 @@
 //
 // Uses fg32b.ps for aligned 8-byte gathers (fast path) and falls back to
 // fgb.ps for chunks that straddle a 32-byte alignment boundary.
-static inline float compute_row_dot_q8_0(const block_q8_0* q_row,
-                                         const float* b_col,
-                                         int64_t K_blocks) {
+static inline float q8_dot_compute(const block_q8_0* q_row,
+                                   const float* b_col,
+                                   int64_t K_blocks) {
     const int32_t gather_pattern[8] = {0, 1, 2, 3, 4, 5, 6, 7};
     const uint64_t gather_0_to_7 = 0x398a418820ULL;
-
-    unsigned long saved_mask;
-    __asm__ volatile("mova.x.m %0" : "=r"(saved_mask));
-    __asm__ volatile("mov.m.x m0, x0, 0xFF");
-    __asm__ volatile("flw.ps f31, %[g]\n" : : [g] "m"(*(const int32_t(*)[8])gather_pattern) : "f31");
+    __asm__ volatile(
+        "flw.ps f31, %[g]\n"
+        :
+        : [g] "m"(*(const int32_t(*)[8])gather_pattern)
+        : "f31"
+    );
     __asm__ volatile("fbci.pi f20, 0" ::: "f20");  // vector accumulator
 
     for (int64_t kb = 0; kb < K_blocks; kb++) {
@@ -204,7 +218,16 @@ static inline float compute_row_dot_q8_0(const block_q8_0* q_row,
         :: "t0", "f1", "f2", "f3", "f4", "f5"
     );
 
-    __asm__ volatile("mova.m.x %0" :: "r"(saved_mask));
+    return result;
+}
+
+static inline float compute_row_dot_q8_0(const block_q8_0* q_row,
+                                         const float* b_col,
+                                         int64_t K_blocks) {
+    q8_dot_state state;
+    q8_dot_begin(&state);
+    const float result = q8_dot_compute(q_row, b_col, K_blocks);
+    q8_dot_end(&state);
     return result;
 }
 
