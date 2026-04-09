@@ -23,9 +23,11 @@
 #define STRIDE_M        2048  /* 32 shires x 32 minions x 2 harts */
 #define STRIDE_M_KSPLIT 1024  /* 32 shires x 32 minions (both harts share rows) */
 #define KSPLIT_MIN_K_BLOCKS 256   /* K >= 8192 elements */
+#define KSPLIT_SMALL_ROWS_K_BLOCKS 64   /* K >= 2048 elements for very small M */
 #define KSPLIT_MAX_ROWS     8     /* max rows per minion for K-split */
 #define TILE_KB           256     /* K-tile size in Q8_0 blocks (8192 elems, 32KB B data) */
 #define KSPLIT_GROUP_ROWS 4
+#define SIMPLE_X2_ROWS     2
 
 int entry_point(struct et_sgemm_params* params, void* env) {
     uint64_t hart_id = get_hart_id();
@@ -42,6 +44,7 @@ int entry_point(struct et_sgemm_params* params, void* env) {
     const int64_t lda = params->lda;   /* bytes per row of A (Q8_0) */
     const int64_t ldb = params->ldb;   /* bytes per row of B (F32) */
     const int64_t ldc = params->ldc;   /* bytes per row of C (F32) */
+    const int use_simple_x2 = ((lda & 31) == 0);
 
     /* K-split decision: both harts in a minion collaborate on same rows */
     const int64_t minion_id = hart_id >> 1;          /* 0..1023 global */
@@ -49,15 +52,22 @@ int entry_point(struct et_sgemm_params* params, void* env) {
     const int is_hart1 = hart_id & 1;
     const int64_t rows_per_minion = (M + STRIDE_M_KSPLIT - 1) / STRIDE_M_KSPLIT;
     const int64_t k_half = K_blocks / 2;
+    const int use_ksplit_small_rows = (rows_per_minion <= 2)
+                                   && (K_blocks >= KSPLIT_SMALL_ROWS_K_BLOCKS);
     /*
      * K-split when K is large enough to benefit, and either:
      *   - few rows (≤4): always safe, proven working
      *   - more rows (5-8): only if each hart's half fits in one tile,
      *     otherwise L1 thrashing from 2 harts × 8 rows kills performance
+     *
+     * Also allow K-split earlier for the low-M regime (≤2 rows/minion). In
+     * that case the simple row-striped path leaves half the machine idle, so
+     * using both harts on each row pays off even for moderate K.
      */
-    const int use_ksplit = (K_blocks >= KSPLIT_MIN_K_BLOCKS)
-                        && (rows_per_minion <= KSPLIT_MAX_ROWS)
-                        && (rows_per_minion <= 4 || k_half <= TILE_KB);
+    const int use_ksplit = ((K_blocks >= KSPLIT_MIN_K_BLOCKS)
+                         && (rows_per_minion <= KSPLIT_MAX_ROWS)
+                         && (rows_per_minion <= 4 || k_half <= TILE_KB))
+                        || use_ksplit_small_rows;
     const int use_ksplit_group = !use_ksplit
                               && (K_blocks >= KSPLIT_MIN_K_BLOCKS)
                               && (rows_per_minion > 4)
@@ -230,18 +240,46 @@ int entry_point(struct et_sgemm_params* params, void* env) {
             q8_dot_end(&q8_state);
         }
     } else {
-        /* Simple path for small K (single tile, no B reuse benefit) */
+        /*
+         * Simple path for small K.
+         *
+         * When `lda` is 32-byte aligned, every row has the same block-alignment
+         * pattern. That lets us compute two rows together and reuse each loaded
+         * B chunk across both rows instead of reloading it in a second dot call.
+         */
         for (int64_t n = 0; n < N; n++) {
             const float* b_col = (const float*)(B + n * ldb);
             q8_dot_state q8_state;
             q8_dot_begin(&q8_state);
 
-            for (int64_t m = hart_id; m < M; m += STRIDE_M) {
-                const block_q8_0* q_row = (const block_q8_0*)(A + m * lda);
-                float sum = q8_dot_compute(q_row, b_col, K_blocks);
+            if (use_simple_x2) {
+                for (int64_t m0 = hart_id; m0 < M; m0 += STRIDE_M * SIMPLE_X2_ROWS) {
+                    const int64_t m1 = m0 + STRIDE_M;
+                    const block_q8_0* q_row0 = (const block_q8_0*)(A + m0 * lda);
 
-                float* dst = (float*)(C + n * ldc + m * sizeof(float));
-                atomic_store_f32((volatile float*)dst, sum);
+                    if (m1 < M) {
+                        const block_q8_0* q_row1 = (const block_q8_0*)(A + m1 * lda);
+                        float s0, s1;
+                        q8_dot_compute_x2_aligned(q_row0, q_row1, b_col, K_blocks, &s0, &s1);
+
+                        float* dst0 = (float*)(C + n * ldc + m0 * sizeof(float));
+                        float* dst1 = (float*)(C + n * ldc + m1 * sizeof(float));
+                        atomic_store_f32((volatile float*)dst0, s0);
+                        atomic_store_f32((volatile float*)dst1, s1);
+                    } else {
+                        float sum = q8_dot_compute(q_row0, b_col, K_blocks);
+                        float* dst = (float*)(C + n * ldc + m0 * sizeof(float));
+                        atomic_store_f32((volatile float*)dst, sum);
+                    }
+                }
+            } else {
+                for (int64_t m = hart_id; m < M; m += STRIDE_M) {
+                    const block_q8_0* q_row = (const block_q8_0*)(A + m * lda);
+                    float sum = q8_dot_compute(q_row, b_col, K_blocks);
+
+                    float* dst = (float*)(C + n * ldc + m * sizeof(float));
+                    atomic_store_f32((volatile float*)dst, sum);
+                }
             }
 
             q8_dot_end(&q8_state);

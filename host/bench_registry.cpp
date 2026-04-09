@@ -60,6 +60,13 @@ std::vector<TestPoint> q8_sweep_points() {
             points.push_back({dims[0], dims[1], n});
         }
     }
+
+    // LLaMA 3.2 8B decode GEMV shapes. Keep these as explicit N=1 cases so
+    // the sweep does not balloon temporary/output allocations.
+    points.push_back({128256, 4096, 1});  // output.weight
+    points.push_back({14336, 4096, 1});   // ffn_gate
+    points.push_back({1024, 4096, 1});    // attn_v
+
     return points;
 }
 

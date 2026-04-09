@@ -49,7 +49,7 @@ int entry_point(struct et_bw_params* params, void* env) {
 
     setup_cache_scp();
 #if CACHEOP_MAX > 0 || REP_RATE > 0
-    ucache_control(1, REP_RATE, CACHEOP_MAX);
+    ucache_control(0, REP_RATE, CACHEOP_MAX);
 #endif
     CLEAR_TENSOR_ERROR;
 
