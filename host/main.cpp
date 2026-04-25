@@ -43,6 +43,7 @@ struct CliOptions {
     bool custom_seed = false;
     std::string kernel_override;
     bool diag = false;
+    bool hang = false;
 };
 
 struct AllocationPlan {
@@ -87,6 +88,8 @@ bool parse_cli(int argc, char** argv, CliOptions& options, std::string& error) {
             options.custom_seed = true;
         } else if (std::strcmp(argv[i], "--diag") == 0) {
             options.diag = true;
+        } else if (std::strcmp(argv[i], "--hang") == 0) {
+            options.hang = true;
         } else {
             error = "Invalid arguments";
             return false;
@@ -112,7 +115,7 @@ void print_usage(const char* bench_names) {
         "  --csv FILE      Write results to CSV\n"
         "  --kernel ELF    Override kernel binary path\n"
         "  --seed SEED     Random seed for input data (default: 42)\n"
-        "  --diag          Run device diagnostic (upload, kernel exec, readback)\n",
+        "  --diag          Run device diagnostic\n  --hang          Trigger the hang repro kernel (uses -k for CACHEOP_MAX, -m for REP_RATE) (upload, kernel exec, readback)\n",
         bench_names, bench_names);
 }
 
@@ -314,6 +317,37 @@ int main(int argc, char** argv) {
         runtime->freeDevice(device, d_buf);
         runtime->destroyStream(stream);
         return fail ? 1 : 0;
+    }
+    if (options.hang) {
+        struct { uint64_t rep_rate; uint64_t cacheop_max; } hang_params;
+        hang_params.rep_rate = options.M; // Using -m for REP_RATE
+        hang_params.cacheop_max = options.K; // Using -k for CACHEOP_MAX
+
+        const std::string kpath = (fs::path(KERNELS_DIR) / "hang.elf").string();
+        printf("hang: loading %s (REP_RATE=%ld, CACHEOP_MAX=%ld)\n",
+               kpath.c_str(), (long)hang_params.rep_rate, (long)hang_params.cacheop_max);
+        
+        const std::vector<std::byte> elf = read_file(kpath);
+        const rt::LoadCodeResult lr = runtime->loadCode(stream, elf.data(), elf.size());
+        runtime->waitForEvent(lr.event_);
+
+        rt::KernelLaunchOptions opts;
+        opts.setShireMask(kShireMask);
+        opts.setBarrier(true);
+        opts.setFlushL3(false);
+
+        printf("hang: launching kernel...\n");
+        runtime->kernelLaunch(stream, lr.kernel_,
+            reinterpret_cast<const std::byte*>(&hang_params),
+            sizeof(hang_params), opts);
+        
+        printf("hang: waiting for kernel (it might hang here)...\n");
+        runtime->waitForStream(stream);
+        printf("hang: kernel returned (no hang!)\n");
+
+        runtime->unloadCode(lr.kernel_);
+        runtime->destroyStream(stream);
+        return 0;
     }
 
     const std::string kernel_path = options.kernel_override.empty()
