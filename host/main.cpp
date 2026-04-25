@@ -5,14 +5,17 @@
  * in a central registry header instead of being smeared across this file.
  */
 
+#include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <tuple>
 #include <cstdlib>
 #include <cstring>
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
 #include <memory>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -44,6 +47,7 @@ struct CliOptions {
     std::string kernel_override;
     bool diag = false;
     bool hang = false;
+    bool overhead = false;
 };
 
 struct AllocationPlan {
@@ -90,6 +94,8 @@ bool parse_cli(int argc, char** argv, CliOptions& options, std::string& error) {
             options.diag = true;
         } else if (std::strcmp(argv[i], "--hang") == 0) {
             options.hang = true;
+        } else if (std::strcmp(argv[i], "--overhead") == 0) {
+            options.overhead = true;
         } else {
             error = "Invalid arguments";
             return false;
@@ -115,7 +121,7 @@ void print_usage(const char* bench_names) {
         "  --csv FILE      Write results to CSV\n"
         "  --kernel ELF    Override kernel binary path\n"
         "  --seed SEED     Random seed for input data (default: 42)\n"
-        "  --diag          Run device diagnostic\n  --hang          Trigger the hang repro kernel (uses -k for CACHEOP_MAX, -m for REP_RATE) (upload, kernel exec, readback)\n",
+        "  --diag          Run device diagnostic\n  --hang          Trigger the hang repro kernel (uses -k for CACHEOP_MAX, -m for REP_RATE) (upload, kernel exec, readback)\n  --overhead      Measure kernel op-op gap and launch overhead via empty kernels (uses -m for batch size B, -n for outer repeats)\n",
         bench_names, bench_names);
 }
 
@@ -326,7 +332,7 @@ int main(int argc, char** argv) {
         const std::string kpath = (fs::path(KERNELS_DIR) / "hang.elf").string();
         printf("hang: loading %s (REP_RATE=%ld, CACHEOP_MAX=%ld)\n",
                kpath.c_str(), (long)hang_params.rep_rate, (long)hang_params.cacheop_max);
-        
+
         const std::vector<std::byte> elf = read_file(kpath);
         const rt::LoadCodeResult lr = runtime->loadCode(stream, elf.data(), elf.size());
         runtime->waitForEvent(lr.event_);
@@ -340,12 +346,404 @@ int main(int argc, char** argv) {
         runtime->kernelLaunch(stream, lr.kernel_,
             reinterpret_cast<const std::byte*>(&hang_params),
             sizeof(hang_params), opts);
-        
+
         printf("hang: waiting for kernel (it might hang here)...\n");
         runtime->waitForStream(stream);
         printf("hang: kernel returned (no hang!)\n");
 
         runtime->unloadCode(lr.kernel_);
+        runtime->destroyStream(stream);
+        return 0;
+    }
+    if (options.overhead) {
+        // Batch B of empty kernels per launch group; repeat R outer groups.
+        // Each kernel writes (t_start, t_end) mcycle pair to slot[idx].
+        const int B = std::max(2, options.M);          // -m: batch size, need >=2 for gap
+        const int R = std::max(1, options.N);          // -n: outer repeats
+        constexpr size_t kSlot = 64;                    // one cacheline per slot
+        const size_t bytes = static_cast<size_t>(B) * kSlot;
+
+        std::byte* d_buf = runtime->mallocDevice(device, bytes);
+
+        const std::string kpath = (fs::path(KERNELS_DIR) / "overhead.elf").string();
+        const std::vector<std::byte> elf = read_file(kpath);
+        const rt::LoadCodeResult lr = runtime->loadCode(stream, elf.data(), elf.size());
+        runtime->waitForEvent(lr.event_);
+
+        rt::KernelLaunchOptions opts;
+        opts.setShireMask(kShireMask);
+        opts.setBarrier(true);
+        opts.setFlushL3(false);   // kernel-boundary horizon already covers visibility
+
+        struct overhead_params { const void* out; uint64_t idx; };
+
+        // Capture runtime trace so we can recover device-wall (CommandSent ->
+        // ResponseReceived) per launch. body_cyc is read from kernel via
+        // hpmcounter3; device_wall - body gives the firmware envelope (M-mode
+        // boot + teardown + transport).
+        std::stringstream prof_ss;
+        runtime->getProfiler()->start(prof_ss, rt::IProfiler::OutputType::Json);
+
+        // Warmup (one full batch, discarded).
+        for (int i = 0; i < B; ++i) {
+            overhead_params p{d_buf, static_cast<uint64_t>(i)};
+            runtime->kernelLaunch(stream, lr.kernel_,
+                reinterpret_cast<const std::byte*>(&p), sizeof(p), opts);
+        }
+        runtime->waitForStream(stream);
+        check_stream_errors(runtime, stream);
+
+        std::vector<uint8_t> ts_raw(bytes, 0);
+        // helpers indexing into the cacheline-strided buffer
+        auto T0 = [&](int i) -> uint64_t {
+            uint64_t v;
+            std::memcpy(&v, ts_raw.data() + i * kSlot + 0, sizeof(v));
+            return v;
+        };
+        auto T1 = [&](int i) -> uint64_t {
+            uint64_t v;
+            std::memcpy(&v, ts_raw.data() + i * kSlot + 8, sizeof(v));
+            return v;
+        };
+
+        // Stats accumulators.
+        double host_wall_total_us = 0.0;        // batched per-kernel host wall
+        double solo_wall_total_us = 0.0;        // single-kernel host wall
+        long long solo_count = 0;
+        std::vector<double> batched_per_kernel_us_samples;  // us/kernel per batch
+        std::vector<double> solo_us_samples;                // us per solo launch
+
+        // Per-pair stats across all R*((B-1)) gap samples.
+        std::vector<uint64_t> gap_samples;
+        gap_samples.reserve(static_cast<size_t>(R) * (B - 1));
+        std::vector<uint64_t> body_samples;
+        body_samples.reserve(static_cast<size_t>(R) * B);
+        std::vector<uint64_t> body_in_order;            // launch-order, for fw_env subtraction
+        body_in_order.reserve(static_cast<size_t>(R) * B);
+        // For freq derivation: span of (t_start[B-1]-t_start[0]) per batch vs host wall span of that batch
+        double freq_num_cycles = 0.0;
+        double freq_den_us = 0.0;
+
+        // --- Batched runs ---
+        int wrap_body = 0;
+        int wrap_gap = 0;
+        for (int r = 0; r < R; ++r) {
+            const auto t0 = std::chrono::high_resolution_clock::now();
+            for (int i = 0; i < B; ++i) {
+                overhead_params p{d_buf, static_cast<uint64_t>(i)};
+                runtime->kernelLaunch(stream, lr.kernel_,
+                    reinterpret_cast<const std::byte*>(&p), sizeof(p), opts);
+            }
+            runtime->waitForStream(stream);
+            const auto t1 = std::chrono::high_resolution_clock::now();
+            check_stream_errors(runtime, stream);
+
+            const double batch_us = std::chrono::duration<double, std::micro>(t1 - t0).count();
+            host_wall_total_us += batch_us;
+            batched_per_kernel_us_samples.push_back(batch_us / B);
+
+            runtime->memcpyDeviceToHost(stream, d_buf,
+                reinterpret_cast<std::byte*>(ts_raw.data()), bytes);
+            runtime->waitForStream(stream);
+
+            if (r == 0) {
+                const int dump_n = std::min(B, 32);
+                printf("\nraw[r=0] %-3s %20s %20s %14s %14s\n",
+                       "i", "t_start", "t_end", "body_cyc", "gap_to_next");
+                for (int i = 0; i < dump_n; ++i) {
+                    const uint64_t a = T0(i);
+                    const uint64_t b = T1(i);
+                    const int64_t body_d = (int64_t)(b - a);
+                    int64_t gap_d = 0;
+                    if (i + 1 < B) gap_d = (int64_t)(T0(i + 1) - b);
+                    printf("raw[r=0] %-3d %20lu %20lu %14ld %14ld\n",
+                           i, (unsigned long)a, (unsigned long)b,
+                           (long)body_d, (long)gap_d);
+                }
+            }
+
+            for (int i = 0; i < B; ++i) {
+                const uint64_t a = T0(i);
+                const uint64_t b = T1(i);
+                if (b >= a && (b - a) < (1ULL << 32)) {
+                    body_samples.push_back(b - a);
+                    body_in_order.push_back(b - a);
+                } else {
+                    ++wrap_body;
+                    body_in_order.push_back(0);  // sentinel; skipped in fw_env
+                }
+            }
+            for (int i = 0; i + 1 < B; ++i) {
+                const uint64_t t_end_i = T1(i);
+                const uint64_t t_start_next = T0(i + 1);
+                if (t_start_next >= t_end_i && (t_start_next - t_end_i) < (1ULL << 32)) {
+                    gap_samples.push_back(t_start_next - t_end_i);
+                } else {
+                    ++wrap_gap;
+                }
+            }
+
+            const uint64_t span_cycles = T0(B - 1) - T0(0);
+            freq_num_cycles += static_cast<double>(span_cycles);
+            freq_den_us += batch_us; // approximate: full batch wall ~ span + tail
+        }
+
+        // --- Solo runs (one kernel at a time, individually waited).
+        // Each solo writes to slot i so we can recover per-launch body cycles.
+        // Cap at B so each gets a distinct slot.
+        const int solo_launches = std::min({64, std::max(8, R), B});
+        // discard a couple
+        for (int i = 0; i < 2; ++i) {
+            overhead_params p{d_buf, 0};
+            runtime->kernelLaunch(stream, lr.kernel_,
+                reinterpret_cast<const std::byte*>(&p), sizeof(p), opts);
+            runtime->waitForStream(stream);
+        }
+        check_stream_errors(runtime, stream);
+        for (int i = 0; i < solo_launches; ++i) {
+            overhead_params p{d_buf, static_cast<uint64_t>(i)};
+            const auto t0 = std::chrono::high_resolution_clock::now();
+            runtime->kernelLaunch(stream, lr.kernel_,
+                reinterpret_cast<const std::byte*>(&p), sizeof(p), opts);
+            runtime->waitForStream(stream);
+            const auto t1 = std::chrono::high_resolution_clock::now();
+            const double us = std::chrono::duration<double, std::micro>(t1 - t0).count();
+            solo_wall_total_us += us;
+            solo_us_samples.push_back(us);
+            ++solo_count;
+        }
+        check_stream_errors(runtime, stream);
+        // Readback solo timestamps; body_solo[i] = T1(i) - T0(i).
+        runtime->memcpyDeviceToHost(stream, d_buf,
+            reinterpret_cast<std::byte*>(ts_raw.data()), bytes);
+        runtime->waitForStream(stream);
+        std::vector<uint64_t> body_solo_in_order;
+        body_solo_in_order.reserve(solo_launches);
+        for (int i = 0; i < solo_launches; ++i) {
+            const uint64_t a = T0(i);
+            const uint64_t b = T1(i);
+            if (b >= a && (b - a) < (1ULL << 32)) {
+                body_solo_in_order.push_back(b - a);
+            } else {
+                body_solo_in_order.push_back(0);  // sentinel
+            }
+        }
+
+        runtime->getProfiler()->stop();
+
+        // --- Parse the captured trace to recover per-launch device-wall ---
+        // Trace events are JSON value blocks with a "class" string, a
+        // timeStamp.time_since_epoch.count (nanoseconds), and an extras list.
+        // For KernelLaunch we want the "event" id; for CommandSent/
+        // ResponseReceived (Instant) we get the device-side timestamps via
+        // the same event id. We collect (cs_ns, rr_ns) pairs in launch order.
+        std::vector<uint64_t> cs_in_order;
+        std::vector<uint64_t> rr_in_order;
+        {
+            const std::string& s = prof_ss.str();
+            size_t pos = 0;
+            // Helper: find next occurrence of needle starting at pos.
+            auto find_after = [&](const char* needle, size_t from) -> size_t {
+                return s.find(needle, from);
+            };
+            auto extract_count_after = [&](size_t from) -> uint64_t {
+                size_t p = s.find("\"count\":", from);
+                if (p == std::string::npos) return 0;
+                p += 8;
+                while (p < s.size() && (s[p] == ' ' || s[p] == '\t' || s[p] == '\n')) ++p;
+                uint64_t v = 0;
+                while (p < s.size() && s[p] >= '0' && s[p] <= '9') {
+                    v = v * 10 + (uint64_t)(s[p] - '0');
+                    ++p;
+                }
+                return v;
+            };
+            // Walk the buffer block-by-block by anchoring on "\"class\":".
+            while (pos < s.size()) {
+                size_t cp = s.find("\"class\":", pos);
+                if (cp == std::string::npos) break;
+                // Read class string
+                size_t q1 = s.find('"', cp + 8);
+                if (q1 == std::string::npos) break;
+                size_t q2 = s.find('"', q1 + 1);
+                if (q2 == std::string::npos) break;
+                std::string klass = s.substr(q1 + 1, q2 - q1 - 1);
+                pos = q2 + 1;
+                // The block's timestamp is the first "count" after the class.
+                if (klass == "CommandSent") {
+                    uint64_t ts = extract_count_after(pos);
+                    if (ts) cs_in_order.push_back(ts);
+                } else if (klass == "ResponseReceived") {
+                    uint64_t ts = extract_count_after(pos);
+                    if (ts) rr_in_order.push_back(ts);
+                }
+            }
+        }
+
+        // Pair CS/RR by encounter order. On a single stream with barrier,
+        // they appear in launch order.
+        std::vector<uint64_t> dev_wall_ns;        // RR - CS per launch
+        const size_t pair_n = std::min(cs_in_order.size(), rr_in_order.size());
+        dev_wall_ns.reserve(pair_n);
+        for (size_t i = 0; i < pair_n; ++i) {
+            if (rr_in_order[i] >= cs_in_order[i]) {
+                dev_wall_ns.push_back(rr_in_order[i] - cs_in_order[i]);
+            } else {
+                dev_wall_ns.push_back(0);
+            }
+        }
+
+        // Partition: first B are warmup, next R*B are batched, next 2 are
+        // solo-discard, remainder are solo. Anything beyond is ignored.
+        const size_t off_batched = (size_t)B;
+        const size_t off_solo    = off_batched + (size_t)R * (size_t)B + 2;
+        std::vector<uint64_t> dev_wall_batched;
+        std::vector<uint64_t> dev_wall_solo;
+        for (size_t i = off_batched; i < dev_wall_ns.size() && i < off_solo - 2; ++i) {
+            dev_wall_batched.push_back(dev_wall_ns[i]);
+        }
+        for (size_t i = off_solo; i < dev_wall_ns.size(); ++i) {
+            dev_wall_solo.push_back(dev_wall_ns[i]);
+        }
+
+        struct S {
+            size_t n;
+            double mean, stdev;
+            uint64_t mn, p1, p10, p50, p90, p99, mx;
+        };
+        auto stats = [](std::vector<uint64_t>& v) {
+            std::sort(v.begin(), v.end());
+            S s{};
+            s.n = v.size();
+            if (s.n == 0) return s;
+            double sum = 0.0, sq = 0.0;
+            for (uint64_t x : v) { sum += (double)x; sq += (double)x * (double)x; }
+            s.mean = sum / s.n;
+            s.stdev = std::sqrt(std::max(0.0, sq / s.n - s.mean * s.mean));
+            auto pct = [&](double p) -> uint64_t {
+                size_t i = static_cast<size_t>(p * (s.n - 1));
+                return v[i];
+            };
+            s.mn  = v.front();
+            s.p1  = pct(0.01);
+            s.p10 = pct(0.10);
+            s.p50 = pct(0.50);
+            s.p90 = pct(0.90);
+            s.p99 = pct(0.99);
+            s.mx  = v.back();
+            return s;
+        };
+
+        const S g = stats(gap_samples);
+        const S b = stats(body_samples);
+        S dwall_b_ns = stats(dev_wall_batched);
+        S dwall_s_ns = stats(dev_wall_solo);
+
+        const double batched_per_kernel_us = host_wall_total_us / (static_cast<double>(R) * B);
+        const double solo_per_kernel_us = solo_count ? solo_wall_total_us / solo_count : 0.0;
+        const double cyc_per_us = freq_den_us > 0 ? freq_num_cycles / freq_den_us : 0.0;
+        auto u = [&](double c) { return cyc_per_us > 0 ? c / cyc_per_us : 0.0; };
+
+        printf(R"(
+Measurment (time flows left -> right):
+
+  Device sequence across adjacent kernels:
+  ...   kernel k-1    | xxxxxxxxxxxxxxxxxxxxxx |           kernel k         | xxxxxxxxxxxxxxxxxxxxxx | kernel k + 1 .....
+  ------------------------------------------------------------------------------------------------------------------------
+                      |<-     op-op gap      ->|   fw  | kernel body |  fw  |<-     op-op gap      ->|
+
+Where the kernel body is near empty (reads timer, write and leave).
+
+)");
+        printf("[overhead] B=%d R=%d batched=%d solo=%lld discard_body=%d discard_gap=%d cyc_per_us=%.2f\n",
+               B, R, R * B, solo_count, wrap_body, wrap_gap, cyc_per_us);
+
+        printf("\n%-32s %8s %14s %14s %12s %12s %12s %12s %12s %12s %12s\n",
+               "metric", "n", "mean", "stdev", "min", "p1", "p10", "p50", "p90", "p99", "max");
+        auto row_cyc = [&](const char* name, const S& s) {
+            printf("%-32s %8zu %14.1f %14.1f %12lu %12lu %12lu %12lu %12lu %12lu %12lu\n",
+                   name, s.n, s.mean, s.stdev,
+                   (unsigned long)s.mn, (unsigned long)s.p1, (unsigned long)s.p10,
+                   (unsigned long)s.p50, (unsigned long)s.p90, (unsigned long)s.p99,
+                   (unsigned long)s.mx);
+        };
+        auto row_us = [&](const char* name, const S& s) {
+            printf("%-32s %8zu %14.3f %14.3f %12.3f %12.3f %12.3f %12.3f %12.3f %12.3f %12.3f\n",
+                   name, s.n, u(s.mean), u(s.stdev),
+                   u((double)s.mn), u((double)s.p1), u((double)s.p10),
+                   u((double)s.p50), u((double)s.p90), u((double)s.p99),
+                   u((double)s.mx));
+        };
+        // Headline row 1: estimated real op-op gap (on-device, batch-invariant)
+        row_cyc("op-op gap cycles",   g);
+        row_us ("op-op gap us",       g);
+        // Reference: kernel body itself (so the gap has context).
+        row_cyc("kernel body cycles", b);
+        row_us ("kernel body us",     b);
+
+        // Convert ns to us in stats rows.
+        auto row_ns = [&](const char* name, const S& s) {
+            printf("%-32s %8zu %14.3f %14.3f %12.3f %12.3f %12.3f %12.3f %12.3f %12.3f %12.3f\n",
+                   name, s.n, s.mean / 1000.0, s.stdev / 1000.0,
+                   s.mn / 1000.0, s.p1 / 1000.0, s.p10 / 1000.0,
+                   s.p50 / 1000.0, s.p90 / 1000.0, s.p99 / 1000.0,
+                   s.mx / 1000.0);
+        };
+
+        // Headline row 2: single-kernel wall time = solo dev_wall (RR - CS,
+        // no queue depth contamination). This is what one kernel costs end
+        // to end, host-visible.
+        row_ns("single kernel wall time us", dwall_s_ns);
+
+        // Headline row 3: firmware overhead per kernel execution =
+        // dev_wall_solo[i] - body_solo[i] in ns, per-launch. Includes host
+        // <-> device transport; excludes queueing. Stable across batch size.
+        std::vector<uint64_t> fw_overhead_ns;
+        if (cyc_per_us > 0.0) {
+            const size_t n = std::min(body_solo_in_order.size(), dev_wall_solo.size());
+            fw_overhead_ns.reserve(n);
+            for (size_t i = 0; i < n; ++i) {
+                if (body_solo_in_order[i] == 0) continue;
+                const double body_ns = (double)body_solo_in_order[i] / cyc_per_us * 1000.0;
+                const double dw = (double)dev_wall_solo[i];
+                if (dw > body_ns) fw_overhead_ns.push_back((uint64_t)(dw - body_ns));
+            }
+        }
+        S fw_overhead = stats(fw_overhead_ns);
+        row_ns("firmware overhead per kernel us", fw_overhead);
+
+        auto dstats = [](std::vector<double> v) {
+            std::sort(v.begin(), v.end());
+            struct D { size_t n; double mean, stdev, mn, p50, p90, mx; } d{};
+            d.n = v.size();
+            if (!d.n) return d;
+            double sum = 0.0, sq = 0.0;
+            for (double x : v) { sum += x; sq += x * x; }
+            d.mean  = sum / d.n;
+            d.stdev = std::sqrt(std::max(0.0, sq / d.n - d.mean * d.mean));
+            d.mn  = v.front();
+            d.p50 = v[d.n / 2];
+            d.p90 = v[(d.n * 9) / 10];
+            d.mx  = v.back();
+            return d;
+        };
+        const auto bw = dstats(batched_per_kernel_us_samples);
+        const auto sw = dstats(solo_us_samples);
+
+        printf("\n%-32s %8s %12s %12s %12s %12s %12s %12s\n",
+               "host wall metric (us)", "n", "mean", "stdev", "min", "p50", "p90", "max");
+        printf("%-32s %8zu %12.3f %12.3f %12.3f %12.3f %12.3f %12.3f\n",
+               "host wall batched per-kernel",
+               bw.n, bw.mean, bw.stdev, bw.mn, bw.p50, bw.p90, bw.mx);
+        printf("%-32s %8zu %12.3f %12.3f %12.3f %12.3f %12.3f %12.3f\n",
+               "host wall solo",
+               sw.n, sw.mean, sw.stdev, sw.mn, sw.p50, sw.p90, sw.mx);
+        printf("%-32s %8s %12.3f %12s %12s %12s %12s %12s\n",
+               "host wall solo minus batched",
+               "-", sw.mean - bw.mean, "-", "-", "-", "-", "-");
+
+        runtime->unloadCode(lr.kernel_);
+        runtime->freeDevice(device, d_buf);
         runtime->destroyStream(stream);
         return 0;
     }

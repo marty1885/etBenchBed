@@ -61,6 +61,15 @@ target_link_libraries(diag.elf PRIVATE
 )
 set_target_properties(diag.elf PROPERTIES INTERPROCEDURAL_OPTIMIZATION TRUE)
 
+add_riscv_executable(overhead)
+target_sources(overhead.elf PRIVATE overhead.c crt.S)
+target_include_directories(overhead.elf PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_link_libraries(overhead.elf PRIVATE
+    et-common-libs::cm-umode
+    esperantoTrace::et_trace
+)
+set_target_properties(overhead.elf PROPERTIES INTERPROCEDURAL_OPTIMIZATION TRUE)
+
 add_riscv_executable(hang)
 target_sources(hang.elf PRIVATE hang.c crt.S)
 target_include_directories(hang.elf PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
